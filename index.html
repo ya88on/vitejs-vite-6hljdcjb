@@ -1,0 +1,314 @@
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, onSnapshot } from 'firebase/firestore';
+
+// --- Configuration Firebase unifiée ---
+const firebaseConfig = typeof __firebase_config !== 'undefined'
+  ? JSON.parse(__firebase_config)
+  : {
+      apiKey: "AIzaSyCzQU6UFOTXrtX-NcxqIrQ2O4SRcwk6la0",
+      authDomain: "la-flechette-lilloise-h.firebaseapp.com",
+      projectId: "la-flechette-lilloise-h",
+      storageBucket: "la-flechette-lilloise-h.firebasestorage.app",
+      messagingSenderId: "358904447443",
+      appId: "1:358904447443:web:ff4a88e4af4aedce73ef26",
+      measurementId: "G-4L7PGQ9JXS"
+    };
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-darts-app';
+
+// Constantes
+const PLAYERS = ['Lionel', 'Romain', 'Jason', 'Gregory', 'Bertrand'];
+const OPPONENTS = [
+  'LES CHARLOTS 1',
+  'Ordv 1',
+  'LES BARJOFFRES 2',
+  'LES PATROBONS',
+  'MERCI L AILETTE 2',
+  'TEY EN DUT (eqp)'
+];
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [isAuthLoading, setIsAuthLoading] = useState(true);
+
+  const [matches, setMatches] = useState([]);
+  const [absences, setAbsences] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [activeTab, setActiveTab] = useState('matches'); // 'matches' | 'absences'
+
+  // Formulaires
+  const [newMatch, setNewMatch] = useState({ opponent: OPPONENTS[0], date: '', time: '' });
+  const [newAbsence, setNewAbsence] = useState({ player: PLAYERS[0], date: '', endDate: '' });
+
+  // Notifications
+  const [errorMsg, setErrorMsg] = useState('');
+  const [successMsg, setSuccessMsg] = useState('');
+
+  // 1. Authentification
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (error) {
+        console.error("Erreur auth:", error);
+        setErrorMsg("Impossible de se connecter au serveur.");
+      } finally {
+        setIsAuthLoading(false);
+      }
+    };
+
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, setUser);
+    return () => unsubscribe();
+  }, []);
+
+  // 2. Synchronisation des données
+  useEffect(() => {
+    if (!user) return;
+
+    const matchesRef = collection(db, `artifacts/${appId}/public/data/darts_matches`); const absencesRef = collection(db, `artifacts/${appId}/public/data/darts_absences`);
+
+    let matchesReady = false;
+    let absencesReady = false;
+    const checkLoadingDone = () => {
+      if (matchesReady && absencesReady) setLoading(false);
+    };
+
+    const unsubscribeMatches = onSnapshot(matchesRef, (snapshot) => {
+      const fetched = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      fetched.sort((a, b) => {
+        const timeA = new Date(`${a.date \vert{}\vert{} '1970-01-01'}T${a.time || '00:00'}`).getTime();
+        const timeB = new Date(`${b.date \vert{}\vert{} '1970-01-01'}T${b.time || '00:00'}`).getTime();
+        return timeA - timeB;
+      });
+      setMatches(fetched);
+      matchesReady = true;
+      checkLoadingDone();
+    }, (error) => {
+      console.error("Erreur snapshot matches:", error);
+      setErrorMsg("Erreur de synchronisation des matchs.");
+    });
+
+    const unsubscribeAbsences = onSnapshot(absencesRef, (snapshot) => {
+      const fetched = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      fetched.sort((a, b) => new Date(a.date || '1970-01-01') - new Date(b.date || '1970-01-01'));
+      setAbsences(fetched);
+      absencesReady = true;
+      checkLoadingDone();
+    }, (error) => {
+      console.error("Erreur snapshot absences:", error);
+      setErrorMsg("Erreur de synchronisation des absences.");
+    });
+
+    return () => {
+      unsubscribeMatches();
+      unsubscribeAbsences();
+    };
+  }, [user]);
+
+  // Vérification de présence
+  const isPlayerAbsentOnDate = (player, targetDate) => {
+    return absences.some(abs => {
+      if (abs.player !== player) return false;
+      if (abs.endDate) {
+        return targetDate >= abs.date && targetDate <= abs.endDate;
+      }
+      return targetDate === abs.date;
+    });
+  };
+
+  // 3. Actions Matchs
+  const handleAddMatch = async (e) => {
+    e.preventDefault();
+    if (!user || !newMatch.opponent || !newMatch.date) return;
+
+    const absentPlayersAtDate = PLAYERS.filter(player => isPlayerAbsentOnDate(player, newMatch.date));
+
+    if (absentPlayersAtDate.length >= 2) {
+      setErrorMsg(`Impossible de jouer : ${absentPlayersAtDate.length} joueurs absents (${absentPlayersAtDate.join(', ')}).`);
+      return;
+    }
+
+    try {
+      const initialAttendance = {};
+      PLAYERS.forEach(p => { initialAttendance[p] = 'À valider'; });
+
+      await addDoc(collection(db, `artifacts/${appId}/public/data/darts_matches`), { opponent: newMatch.opponent, date: newMatch.date, time: newMatch.time, attendance: initialAttendance, createdAt: new Date().toISOString() });  setNewMatch({ opponent: OPPONENTS[0], date: '', time: '' }); setSuccessMsg("Match créé avec succès !"); setTimeout(() => setSuccessMsg(''), 3500); setErrorMsg(''); } catch (error) { console.error("Erreur création match:", error); setErrorMsg("Erreur lors de la création du match."); } };  const handleToggleAttendance = async (matchId, playerName, currentStatus) => { if (!user) return;  let newStatus = 'À valider'; if (currentStatus === 'À valider') newStatus = 'Présent'; else if (currentStatus === 'Présent') newStatus = 'Absent'; else if (currentStatus === 'Absent') newStatus = 'À valider';  try { const matchRef = doc(db, `artifacts/${appId}/public/data/darts_matches/${matchId}`); await updateDoc(matchRef, { [`attendance.${playerName}`]: newStatus
+      });
+    } catch (error) {
+      console.error("Erreur MAJ présence:", error);
+    }
+  };
+
+  const handleDeleteMatch = async (matchId) => {
+    if (!user) return;
+    try {
+      await deleteDoc(doc(db, `artifacts/${appId}/public/data/darts_matches/${matchId}`));
+    } catch (error) {
+      console.error("Erreur suppression match:", error);
+    }
+  };
+
+  // 4. Actions Absences
+  const handleAddAbsence = async (e) => {
+    e.preventDefault();
+    if (!user || !newAbsence.player || !newAbsence.date) return;
+
+    if (newAbsence.endDate && newAbsence.endDate < newAbsence.date) {
+      setErrorMsg("La date de fin ne peut pas être avant la date de début.");
+      return;
+    }
+
+    try {
+      await addDoc(collection(db, `artifacts/${appId}/public/data/darts_absences`), { player: newAbsence.player, date: newAbsence.date, endDate: newAbsence.endDate \vert{}\vert{} null, createdAt: new Date().toISOString() }); setNewAbsence({ ...newAbsence, date: '', endDate: '' }); setErrorMsg(''); } catch (error) { console.error("Erreur création absence:", error); } };  const handleDeleteAbsence = async (absenceId) => { if (!user) return; try { await deleteDoc(doc(db, `artifacts/${appId}/public/data/darts_absences/${absenceId}`)); } catch (error) { console.error("Erreur suppression absence:", error); } };  const formatDate = (dateStr) => { if (!dateStr) return ''; return new Date(`${dateStr}T12:00:00`).toLocaleDateString('fr-FR', { day: 'numeric', month: 'short' });
+  };
+
+  if (isAuthLoading) {
+    return (
+      <div className="min-h-screen bg-zinc-950 flex justify-center items-center text-white">
+        <p>Chargement... ⏳</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-zinc-950 text-zinc-100 font-sans pb-24">
+      {/* En-tête */}
+      <header className="bg-zinc-900 border-b border-zinc-800 p-4 sticky top-0 z-20 shadow-lg">
+        <div className="max-w-4xl mx-auto flex items-center gap-3">
+          <span className="text-3xl">🎯</span>
+          <div>
+            <h1 className="text-2xl font-black text-white">
+              La Fléchette <span className="text-red-500">Lilloise H</span>
+            </h1>
+            <p className="text-xs text-zinc-400 font-medium uppercase tracking-widest">Gestion d'équipe</p>
+          </div>
+        </div>
+      </header>
+
+      {/* Notifications */}
+      {errorMsg && (
+        <div className="max-w-4xl mx-auto mt-4 px-4">
+          <div className="bg-red-500/20 border border-red-500 text-red-200 px-4 py-3 rounded-xl flex items-center gap-3">
+            <span className="text-xl">❌</span>
+            <span className="flex-grow">{errorMsg}</span>
+            <button onClick={() => setErrorMsg('')} className="font-bold text-xl hover:text-white">×</button>
+          </div>
+        </div>
+      )}
+
+      {successMsg && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-green-600 text-white px-6 py-3 rounded-full shadow-lg border border-green-400 font-bold flex items-center gap-2 z-50 animate-in slide-in-from-bottom-5 fade-in duration-300">
+          <span className="text-xl">✅</span> {successMsg}
+        </div>
+      )}
+
+      <main className="max-w-4xl mx-auto px-4 mt-6 space-y-6">
+        {/* Navigation */}
+        <div className="flex bg-zinc-900 border border-zinc-800 rounded-xl p-1 max-w-sm mx-auto">
+          <button
+            onClick={() => setActiveTab('matches')}
+            className={`flex-1 py-3 text-sm font-bold rounded-lg transition-colors flex justify-center items-center gap-2 ${
+              activeTab === 'matches' ? 'bg-zinc-800 text-white shadow' : 'text-zinc-500 hover:text-zinc-300'
+            }`}
+          >
+            🎯 Matchs
+          </button>
+          <button
+            onClick={() => setActiveTab('absences')}
+            className={`flex-1 py-3 text-sm font-bold rounded-lg transition-colors flex justify-center items-center gap-2 ${
+              activeTab === 'absences' ? 'bg-zinc-800 text-white shadow' : 'text-zinc-500 hover:text-zinc-300'
+            }`}
+          >
+            🏖️ Absences
+          </button>
+        </div>
+
+        {/* --- ONGLET MATCHS --- */}
+        {activeTab === 'matches' && (
+          <div className="space-y-8 animate-in fade-in">
+            <section className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 shadow-xl">
+              <h2 className="text-lg font-bold text-white mb-4 flex items-center gap-2">
+                <span>➕</span> Nouveau Match
+              </h2>
+              <form onSubmit={handleAddMatch} className="flex flex-col md:flex-row gap-4">
+                <div className="flex-1">
+                  <label className="block text-xs font-bold text-zinc-400 mb-1 uppercase">Équipe Adverse</label>
+                  <select
+                    required
+                    className="w-full bg-zinc-950 border border-zinc-700 text-white rounded-lg px-3 py-2.5 focus:ring-2 focus:ring-red-500 outline-none"
+                    value={newMatch.opponent}
+                    onChange={(e) => setNewMatch({ ...newMatch, opponent: e.target.value })}
+                  >
+                    {OPPONENTS.map(team => <option key={team} value={team}>{team}</option>)}
+                  </select>
+                </div>
+                <div className="w-full md:w-40">
+                  <label className="block text-xs font-bold text-zinc-400 mb-1 uppercase">Date</label>
+                  <input
+                    type="date"
+                    required
+                    className="w-full bg-zinc-950 border border-zinc-700 text-white rounded-lg px-3 py-2.5 [color-scheme:dark] outline-none"
+                    value={newMatch.date}
+                    onChange={(e) => setNewMatch({ ...newMatch, date: e.target.value })}
+                  />
+                </div>
+                <div className="w-full md:w-32">
+                  <label className="block text-xs font-bold text-zinc-400 mb-1 uppercase">Heure</label>
+                  <input
+                    type="time"
+                    required
+                    className="w-full bg-zinc-950 border border-zinc-700 text-white rounded-lg px-3 py-2.5 [color-scheme:dark] outline-none"
+                    value={newMatch.time}
+                    onChange={(e) => setNewMatch({ ...newMatch, time: e.target.value })}
+                  />
+                </div>
+                <div className="flex items-end">
+                  <button type="submit" className="w-full md:w-auto bg-red-600 hover:bg-red-500 text-white font-bold py-2.5 px-6 rounded-lg transition-colors shadow-lg">
+                    Créer
+                  </button>
+                </div>
+              </form>
+            </section>
+
+            <section>
+              <div className="flex justify-between items-center mb-4">
+                <h2 className="text-xl font-bold flex items-center gap-2">📅 Liste des matchs</h2>
+                <span className="bg-zinc-800 px-3 py-1 rounded-full text-xs font-bold border border-zinc-700">{matches.length}</span>
+              </div>
+
+              {loading ? (
+                <div className="text-center py-10 text-zinc-500 font-bold">Chargement... ⏳</div>
+              ) : matches.length === 0 ? (
+                <div className="bg-zinc-900 border border-zinc-800 border-dashed rounded-2xl p-10 text-center text-zinc-500 font-bold">
+                  Aucun match prévu.
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                  {matches.map(match => {
+                    let presentCount = 0;
+
+                    const playerStatuses = PLAYERS.map(player => {
+                      const isGloballyAbsent = isPlayerAbsentOnDate(player, match.date);
+                      const currentMatchStatus = match.attendance?.[player] || 'À valider';
+                      const effectiveStatus = isGloballyAbsent ? 'Absent (Force)' : currentMatchStatus;
+
+                      if (effectiveStatus === 'Présent') presentCount++;
+                      return { player, effectiveStatus, currentMatchStatus, isGloballyAbsent };
+                    });
+
+                    const isValidated = presentCount >= 4;
+
+                    return (
+                      <div
+                        key={match.id}
+                        className={`bg-
